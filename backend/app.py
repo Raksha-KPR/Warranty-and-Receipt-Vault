@@ -1,8 +1,11 @@
 from contextlib import contextmanager
+import csv
+from datetime import date, timedelta
+import io
 from pathlib import Path
 import sqlite3
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
 
 
@@ -43,6 +46,19 @@ def json_body():
     if not isinstance(body, dict):
         return None, (jsonify(error="A JSON object is required."), 400)
     return body, None
+
+
+def compute_return_deadline(purchase_date_str, return_days=7):
+    if return_days in (None, ""):
+        return None
+    try:
+        days = int(return_days)
+        if days < 0:
+            return None
+        year, month, day = map(int, str(purchase_date_str)[:10].split("-"))
+        return (date(year, month, day) + timedelta(days=days)).isoformat()
+    except (ValueError, TypeError):
+        return None
 
 
 @app.errorhandler(sqlite3.IntegrityError)
@@ -136,6 +152,11 @@ def create_purchase():
     except (TypeError, ValueError):
         return jsonify(error="Price and warranty_months must be numeric."), 400
 
+    return_deadline = compute_return_deadline(
+        body["purchase_date"],
+        body.get("return_days", 7),
+    )
+
     with database() as connection:
         store = connection.execute(
             "SELECT store_id FROM Store WHERE store_name = ? AND city IS ? LIMIT 1",
@@ -171,7 +192,7 @@ def create_purchase():
             """
             INSERT INTO Purchase
                 (product_id, store_id, purchase_date, price, receipt_no, return_deadline)
-            VALUES (?, ?, ?, ?, ?, NULL)
+            VALUES (?, ?, ?, ?, ?, ?)
             """,
             (
                 product_id,
@@ -179,6 +200,7 @@ def create_purchase():
                 body["purchase_date"],
                 price,
                 body.get("receipt_no") or None,
+                return_deadline,
             ),
         )
         purchase_id = cursor.lastrowid
@@ -197,7 +219,103 @@ def create_purchase():
             ),
         )
 
-    return jsonify(purchase_id=purchase_id), 201
+    return jsonify(purchase_id=purchase_id, return_deadline=return_deadline), 201
+
+
+@app.patch("/api/purchases/<int:purchase_id>")
+def update_purchase(purchase_id):
+    body, error = json_body()
+    if error:
+        return error
+
+    purchase_updates = []
+    purchase_params = []
+
+    if "price" in body and body["price"] not in (None, ""):
+        try:
+            purchase_updates.append("price = ?")
+            purchase_params.append(float(body["price"]))
+        except (TypeError, ValueError):
+            return jsonify(error="Price must be numeric."), 400
+
+    if "receipt_no" in body:
+        purchase_updates.append("receipt_no = ?")
+        purchase_params.append(body["receipt_no"] or None)
+
+    if "purchase_date" in body and body["purchase_date"]:
+        purchase_updates.append("purchase_date = ?")
+        purchase_params.append(body["purchase_date"])
+
+    if "return_deadline" in body:
+        purchase_updates.append("return_deadline = ?")
+        purchase_params.append(body["return_deadline"] or None)
+
+    warranty_updates = []
+    warranty_params = []
+
+    if "warranty_type" in body and body["warranty_type"]:
+        warranty_updates.append("warranty_type = ?")
+        warranty_params.append(body["warranty_type"])
+
+    if "warranty_months" in body and body["warranty_months"] not in (None, ""):
+        try:
+            months = int(body["warranty_months"])
+            if months < 1:
+                return jsonify(error="Warranty months must be at least 1."), 400
+            warranty_updates.append("warranty_months = ?")
+            warranty_params.append(months)
+        except (TypeError, ValueError):
+            return jsonify(error="Warranty months must be numeric."), 400
+
+    if not purchase_updates and not warranty_updates:
+        return jsonify(error="No updatable fields provided."), 400
+
+    with database() as connection:
+        existing = connection.execute(
+            "SELECT purchase_id FROM Purchase WHERE purchase_id = ?",
+            (purchase_id,),
+        ).fetchone()
+        if existing is None:
+            return jsonify(error="Purchase not found."), 404
+
+        if purchase_updates:
+            connection.execute(
+                f"UPDATE Purchase SET {', '.join(purchase_updates)} WHERE purchase_id = ?",
+                [*purchase_params, purchase_id],
+            )
+
+        if warranty_updates:
+            connection.execute(
+                f"UPDATE Warranty SET {', '.join(warranty_updates)} WHERE purchase_id = ?",
+                [*warranty_params, purchase_id],
+            )
+
+    return jsonify(updated=True, id=purchase_id), 200
+
+
+@app.delete("/api/purchases/<int:purchase_id>")
+def delete_purchase(purchase_id):
+    with database() as connection:
+        existing = connection.execute(
+            "SELECT purchase_id FROM Purchase WHERE purchase_id = ?",
+            (purchase_id,),
+        ).fetchone()
+        if existing is None:
+            return jsonify(error="Purchase not found."), 404
+
+        connection.execute(
+            "DELETE FROM Service_Record WHERE purchase_id = ?",
+            (purchase_id,),
+        )
+        connection.execute(
+            "DELETE FROM Warranty WHERE purchase_id = ?",
+            (purchase_id,),
+        )
+        connection.execute(
+            "DELETE FROM Purchase WHERE purchase_id = ?",
+            (purchase_id,),
+        )
+    return jsonify(deleted=True, id=purchase_id), 200
 
 
 @app.get("/api/expiring")
@@ -262,6 +380,140 @@ def create_service(purchase_id):
             (service_id,),
         ).fetchone()
     return jsonify(dict(service)), 201
+
+
+@app.patch("/api/services/<int:service_id>")
+def update_service(service_id):
+    body, error = json_body()
+    if error:
+        return error
+
+    allowed_statuses = {"Pending", "In Progress", "Completed"}
+    updates = []
+    params = []
+
+    if "status" in body:
+        if body["status"] not in allowed_statuses:
+            return jsonify(error="Invalid status value."), 400
+        updates.append("status = ?")
+        params.append(body["status"])
+
+    if "cost" in body:
+        try:
+            updates.append("cost = ?")
+            params.append(float(body["cost"]))
+        except (TypeError, ValueError):
+            return jsonify(error="Cost must be numeric."), 400
+
+    if not updates:
+        return jsonify(error="No updatable fields provided."), 400
+
+    params.append(service_id)
+    with database() as connection:
+        existing = connection.execute(
+            "SELECT service_id FROM Service_Record WHERE service_id = ?",
+            (service_id,),
+        ).fetchone()
+        if existing is None:
+            return jsonify(error="Service record not found."), 404
+
+        connection.execute(
+            f"UPDATE Service_Record SET {', '.join(updates)} WHERE service_id = ?",
+            params,
+        )
+        updated = connection.execute(
+            """
+            SELECT service_id AS id, service_date AS date, issue, cost, status
+            FROM Service_Record WHERE service_id = ?
+            """,
+            (service_id,),
+        ).fetchone()
+    return jsonify(dict(updated)), 200
+
+
+@app.delete("/api/services/<int:service_id>")
+def delete_service(service_id):
+    with database() as connection:
+        row = connection.execute(
+            "SELECT purchase_id FROM Service_Record WHERE service_id = ?",
+            (service_id,),
+        ).fetchone()
+        if row is None:
+            return jsonify(error="Service record not found."), 404
+
+        purchase_id = row["purchase_id"]
+        connection.execute(
+            "DELETE FROM Service_Record WHERE service_id = ?",
+            (service_id,),
+        )
+    return jsonify(deleted=True, id=service_id, purchase_id=purchase_id), 200
+
+
+@app.get("/api/export.csv")
+def export_csv():
+    with database() as connection:
+        rows = connection.execute(
+            """
+            SELECT pu.purchase_id, p.name AS product_name, p.brand, p.category,
+                   s.store_name, s.city, pu.purchase_date, pu.price,
+                   pu.receipt_no, pu.return_deadline,
+                   MAX(w.end_date) AS warranty_expiry,
+                   (SELECT COUNT(*) FROM Service_Record sr
+                    WHERE sr.purchase_id = pu.purchase_id) AS service_count,
+                   (SELECT COALESCE(SUM(sr.cost), 0) FROM Service_Record sr
+                    WHERE sr.purchase_id = pu.purchase_id) AS total_service_cost
+            FROM Purchase pu
+            JOIN Product p ON p.product_id = pu.product_id
+            JOIN Store s ON s.store_id = pu.store_id
+            LEFT JOIN Warranty w ON w.purchase_id = pu.purchase_id
+            GROUP BY pu.purchase_id
+            ORDER BY pu.purchase_id DESC
+            """
+        ).fetchall()
+
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(
+        [
+            "ID",
+            "Product",
+            "Brand",
+            "Category",
+            "Store",
+            "City",
+            "Purchase Date",
+            "Price",
+            "Receipt No",
+            "Return Deadline",
+            "Warranty Expiry",
+            "Service Count",
+            "Total Service Cost",
+        ]
+    )
+    for r in rows:
+        writer.writerow(
+            [
+                r["purchase_id"],
+                r["product_name"],
+                r["brand"] or "",
+                r["category"],
+                r["store_name"],
+                r["city"] or "",
+                r["purchase_date"],
+                r["price"],
+                r["receipt_no"] or "",
+                r["return_deadline"] or "",
+                r["warranty_expiry"] or "",
+                r["service_count"],
+                r["total_service_cost"],
+            ]
+        )
+
+    return Response(
+        buffer.getvalue(),
+        mimetype="text/csv",
+        headers={"Content-Disposition": "attachment; filename=vault_ledger.csv"},
+    )
 
 
 initialize_database()
