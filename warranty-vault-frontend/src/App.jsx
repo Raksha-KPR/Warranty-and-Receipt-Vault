@@ -1,590 +1,874 @@
-import React, { useCallback, useEffect, useState } from 'react';
-import {
-  Plus,
-  Wrench,
-  Search,
-  X,
-  AlertCircle,
-  Check,
-  FileText,
-  ShieldCheck,
-  Clock,
-  Sparkles,
-  Calendar
-} from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from "react";
+import "./App.css";
 
-const emptyPurchaseForm = {
-  product_name: '',
-  brand: '',
-  category: 'Electronics',
-  store_name: '',
-  city: '',
-  price: '',
-  receipt_no: '',
-  purchase_date: '',
-  warranty_type: 'Standard',
-  warranty_months: '12'
-};
+const API_BASE = "http://127.0.0.1:5000/api";
+const EXPIRING_SOON_DAYS = 30;
 
-async function requestJson(url, options) {
-  const response = await fetch(url, {
-    ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      ...options?.headers,
-    },
-  });
-  const result = await response.json();
-  if (!response.ok) {
-    throw new Error(result.error || `Request failed (${response.status}).`);
-  }
-  return result;
+function parseLocalDate(dateStr) {
+  if (!dateStr) return null;
+  const parts = String(dateStr).slice(0, 10).split("-").map(Number);
+  if (parts.length !== 3 || parts.some(Number.isNaN)) return null;
+  return new Date(parts[0], parts[1] - 1, parts[2]);
 }
 
+function diffDaysFromToday(dateStr) {
+  const target = parseLocalDate(dateStr);
+  if (!target) return null;
+  const now = new Date();
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const msPerDay = 1000 * 60 * 60 * 24;
+  return Math.round((target - today) / msPerDay);
+}
+
+function getWarrantyMeta(purchase) {
+  const expiry = purchase.warranty_expiry || purchase.warranties?.[0]?.end_date;
+  if (!expiry) {
+    return { label: "Not recorded", tone: "muted", status: "none" };
+  }
+  const daysLeft = diffDaysFromToday(expiry);
+  if (daysLeft === null) {
+    return { label: `Until ${expiry}`, tone: "info", status: "active" };
+  }
+  if (daysLeft < 0) {
+    return { label: `Expired (${expiry})`, tone: "danger", status: "expired" };
+  }
+  if (daysLeft <= EXPIRING_SOON_DAYS) {
+    return {
+      label: `${daysLeft}d left · Until ${expiry}`,
+      tone: "warning",
+      status: "expiring",
+    };
+  }
+  return { label: `Active until ${expiry}`, tone: "success", status: "active" };
+}
+
+function getReturnMeta(purchase) {
+  if (!purchase.return_deadline) {
+    return { label: "Not set", tone: "muted", isExpiringSoon: false };
+  }
+  const daysLeft = diffDaysFromToday(purchase.return_deadline);
+  if (daysLeft === null) {
+    return { label: purchase.return_deadline, tone: "muted", isExpiringSoon: false };
+  }
+  if (daysLeft < 0) {
+    return { label: "Closed", tone: "muted", isExpiringSoon: false };
+  }
+  return {
+    label: `${daysLeft}d left (${purchase.return_deadline})`,
+    tone: daysLeft <= 7 ? "warning" : "info",
+    isExpiringSoon: daysLeft <= 7,
+  };
+}
+
+function getServiceStatusTone(status) {
+  if (status === "Completed") return "success";
+  if (status === "In Progress") return "warning";
+  return "info";
+}
+
+const initialPurchaseForm = {
+  product_name: "",
+  brand: "",
+  category: "Electronics",
+  store_name: "",
+  city: "",
+  purchase_date: new Date().toISOString().slice(0, 10),
+  price: "",
+  receipt_no: "",
+  return_days: "7",
+  warranty_type: "Standard",
+  warranty_months: "12",
+  warranty_start_date: "",
+};
+
+const initialServiceForm = {
+  service_date: new Date().toISOString().slice(0, 10),
+  issue: "",
+  cost: "0",
+  status: "Pending",
+};
+
 export default function App() {
-  const [items, setItems] = useState([]);
-  const [expiring, setExpiring] = useState({ warranties: [], return_windows: [] });
-  const [activeTab, setActiveTab] = useState('ALL'); // 'ALL' | 'EXPIRING' | 'EXPIRED'
-  const [searchQuery, setSearchQuery] = useState('');
-  const [selectedItemId, setSelectedItemId] = useState(null);
-  const [services, setServices] = useState([]);
-  const [servicesLoading, setServicesLoading] = useState(false);
-  const [servicesError, setServicesError] = useState('');
-  const [isAddModalOpen, setIsAddModalOpen] = useState(false);
-  const [toast, setToast] = useState(null);
+  const [purchases, setPurchases] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
 
-  const [formData, setFormData] = useState({ ...emptyPurchaseForm });
+  const [filterTab, setFilterTab] = useState("all"); // all | expiring | expired
+  const [searchQuery, setSearchQuery] = useState("");
 
-  const [serviceForm, setServiceForm] = useState({
-    date: '',
-    issue: '',
-    cost: ''
+  const [isModalOpen, setIsModalOpen] = useState(false);
+  const [purchaseForm, setPurchaseForm] = useState(initialPurchaseForm);
+  const [submittingPurchase, setSubmittingPurchase] = useState(false);
+
+  const [editingPurchase, setEditingPurchase] = useState(null);
+  const [editForm, setEditForm] = useState({
+    price: "",
+    receipt_no: "",
+    return_deadline: "",
+    warranty_type: "Standard",
+    warranty_months: "12",
   });
+  const [savingEdit, setSavingEdit] = useState(false);
 
-  const showToast = useCallback((message, type = 'info') => {
-    setToast({ message, type });
-    setTimeout(() => setToast(null), 4500);
-  }, []);
+  const [selectedPurchaseId, setSelectedPurchaseId] = useState(null);
+  const [services, setServices] = useState([]);
+  const [loadingServices, setLoadingServices] = useState(false);
+  const [serviceForm, setServiceForm] = useState(initialServiceForm);
+  const [submittingService, setSubmittingService] = useState(false);
 
-  const loadPurchases = async () => {
-    const data = await requestJson('/api/purchases');
-    setItems(data);
-  };
+  const servicesSectionRef = useRef(null);
 
-  const loadExpiring = async () => {
-    const data = await requestJson('/api/expiring');
-    setExpiring(data);
-  };
+  async function loadPurchases() {
+    setLoading(true);
+    setError("");
+    try {
+      const res = await fetch(`${API_BASE}/purchases`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Failed to load purchases");
+      setPurchases(Array.isArray(data) ? data : []);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoading(false);
+    }
+  }
 
   useEffect(() => {
-    let active = true;
-    const loadInitialData = async () => {
-      try {
-        const [purchaseData, expiringData] = await Promise.all([
-          requestJson('/api/purchases'),
-          requestJson('/api/expiring'),
-        ]);
-        if (active) {
-          setItems(purchaseData);
-          setExpiring(expiringData);
-        }
-      } catch (error) {
-        if (active) showToast(error.message, 'error');
-      }
-    };
-    loadInitialData();
-    return () => {
-      active = false;
-    };
-  }, [showToast]);
+    loadPurchases();
+  }, []);
 
-  const getDaysRemaining = (dateString) => {
-    if (!dateString) return null;
-    const parseUtcDate = (value) => {
-      const [year, month, day] = value.split('-').map(Number);
-      return Date.UTC(year, month - 1, day);
-    };
-    const days = (parseUtcDate(dateString) - parseUtcDate(new Date().toISOString().slice(0, 10))) /
-      (1000 * 60 * 60 * 24);
-    return Number.isFinite(days) ? days : null;
-  };
+  const enrichedPurchases = useMemo(() => {
+    return purchases.map((item) => {
+      const warranty = getWarrantyMeta(item);
+      const returnWindow = getReturnMeta(item);
+      const isExpiringSoon =
+        warranty.status === "expiring" || returnWindow.isExpiringSoon;
+      const isExpired = warranty.status === "expired";
+      return {
+        ...item,
+        warranty,
+        returnWindow,
+        isExpiringSoon,
+        isExpired,
+      };
+    });
+  }, [purchases]);
 
-  const isExpiringSoon = (item) => {
-    const wDays = getDaysRemaining(item.warranty_expiry);
-    const rDays = getDaysRemaining(item.return_deadline);
-    return (wDays !== null && wDays >= 0 && wDays <= 30) ||
-      (rDays !== null && rDays >= 0 && rDays <= 7);
-  };
+  const stats = useMemo(() => {
+    const total = enrichedPurchases.length;
+    const expiringSoon = enrichedPurchases.filter((p) => p.isExpiringSoon).length;
+    const activeCoverage = enrichedPurchases.filter(
+      (p) => p.warranty.status === "active" || p.warranty.status === "expiring"
+    ).length;
+    const expired = enrichedPurchases.filter((p) => p.isExpired).length;
+    return { total, expiringSoon, activeCoverage, expired };
+  }, [enrichedPurchases]);
 
-  const isExpired = (item) => {
-    const days = getDaysRemaining(item.warranty_expiry);
-    return days !== null && days < 0;
-  };
+  const filteredPurchases = useMemo(() => {
+    const q = searchQuery.trim().toLowerCase();
+    return enrichedPurchases.filter((item) => {
+      if (filterTab === "expiring" && !item.isExpiringSoon) return false;
+      if (filterTab === "expired" && !item.isExpired) return false;
+      if (!q) return true;
+      const haystack = [
+        item.product_name,
+        item.brand,
+        item.category,
+        item.store_name,
+        item.city,
+        item.receipt_no,
+      ]
+        .filter(Boolean)
+        .join(" ")
+        .toLowerCase();
+      return haystack.includes(q);
+    });
+  }, [enrichedPurchases, filterTab, searchQuery]);
 
-  const handleAddPurchase = async (e) => {
+  const totalServiceCost = useMemo(() => {
+    return services.reduce((sum, s) => sum + Number(s.cost || 0), 0);
+  }, [services]);
+
+  function openEditModal(item) {
+    const firstWarranty = item.warranties?.[0];
+    setEditingPurchase(item);
+    setEditForm({
+      price: item.price ?? "",
+      receipt_no: item.receipt_no ?? "",
+      return_deadline: item.return_deadline ?? "",
+      warranty_type: firstWarranty?.type || "Standard",
+      warranty_months: String(firstWarranty?.warranty_months || 12),
+    });
+  }
+
+  async function handleSaveEdit(e) {
     e.preventDefault();
+    if (!editingPurchase) return;
+    setSavingEdit(true);
+    setError("");
     try {
-      await requestJson('/api/purchases', {
-        method: 'POST',
+      const res = await fetch(`${API_BASE}/purchases/${editingPurchase.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          ...formData,
-          price: Number(formData.price),
-          warranty_months: Number(formData.warranty_months),
-          warranty_start_date: formData.purchase_date,
+          price: editForm.price === "" ? null : Number(editForm.price),
+          receipt_no: editForm.receipt_no.trim() || null,
+          return_deadline: editForm.return_deadline || null,
+          warranty_type: editForm.warranty_type,
+          warranty_months: Number(editForm.warranty_months),
         }),
       });
-      setFormData({ ...emptyPurchaseForm });
-      setIsAddModalOpen(false);
-      showToast('Purchase saved to the vault.', 'success');
-      await Promise.all([loadPurchases(), loadExpiring()]);
-    } catch (error) {
-      showToast(error.message, 'error');
-    }
-  };
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Could not update purchase");
 
-  const handleOpenServices = async (purchaseId) => {
-    setSelectedItemId(purchaseId);
-    setServices([]);
-    setServicesLoading(true);
-    setServicesError('');
-    try {
-      setServices(await requestJson(`/api/purchases/${purchaseId}/services`));
-    } catch (error) {
-      setServicesError(error.message);
-      showToast(error.message, 'error');
+      setEditingPurchase(null);
+      await loadPurchases();
+    } catch (err) {
+      setError(err.message);
     } finally {
-      setServicesLoading(false);
+      setSavingEdit(false);
     }
-  };
+  }
 
-  const handleAddServiceLog = async (e) => {
-    e.preventDefault();
-    const targetItem = items.find((i) => i.id === selectedItemId);
-    if (!targetItem) return;
+  async function openServices(purchaseId) {
+    setSelectedPurchaseId(purchaseId);
+    setLoadingServices(true);
+    setError("");
     try {
-      const service = await requestJson(`/api/purchases/${selectedItemId}/services`, {
-        method: 'POST',
-        body: JSON.stringify({
-          service_date: serviceForm.date,
-          issue: serviceForm.issue,
-          cost: Number(serviceForm.cost) || 0,
-          status: 'Pending',
-        }),
+      const res = await fetch(`${API_BASE}/purchases/${purchaseId}/services`);
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Failed to load service logs");
+      setServices(Array.isArray(data) ? data : []);
+      requestAnimationFrame(() => {
+        servicesSectionRef.current?.scrollIntoView({
+          behavior: "smooth",
+          block: "start",
+        });
       });
-      setServices((previous) => [service, ...previous]);
-      setItems((previous) =>
-        previous.map((item) =>
-          item.id === selectedItemId
-            ? { ...item, service_count: item.service_count + 1 }
-            : item
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setLoadingServices(false);
+    }
+  }
+
+  async function handleCreatePurchase(e) {
+    e.preventDefault();
+    setSubmittingPurchase(true);
+    setError("");
+    try {
+      const payload = {
+        ...purchaseForm,
+        price: Number(purchaseForm.price),
+        warranty_months: Number(purchaseForm.warranty_months),
+        return_days:
+          purchaseForm.return_days === "" ? null : Number(purchaseForm.return_days),
+        brand: purchaseForm.brand.trim() || null,
+        city: purchaseForm.city.trim() || null,
+        receipt_no: purchaseForm.receipt_no.trim() || null,
+        warranty_start_date: purchaseForm.warranty_start_date || null,
+      };
+      const res = await fetch(`${API_BASE}/purchases`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Could not save purchase");
+
+      setPurchaseForm(initialPurchaseForm);
+      setIsModalOpen(false);
+      await loadPurchases();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSubmittingPurchase(false);
+    }
+  }
+
+  async function handleDeletePurchase(purchaseId, productName) {
+    if (!window.confirm(`Delete "${productName || `#${purchaseId}`}" and its logs?`)) {
+      return;
+    }
+    setError("");
+    try {
+      const res = await fetch(`${API_BASE}/purchases/${purchaseId}`, {
+        method: "DELETE",
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Could not delete purchase");
+
+      if (selectedPurchaseId === purchaseId) {
+        setSelectedPurchaseId(null);
+        setServices([]);
+      }
+      await loadPurchases();
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  async function handleCreateService(e) {
+    e.preventDefault();
+    if (!selectedPurchaseId) return;
+    setSubmittingService(true);
+    setError("");
+    try {
+      const res = await fetch(
+        `${API_BASE}/purchases/${selectedPurchaseId}/services`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            ...serviceForm,
+            cost: Number(serviceForm.cost || 0),
+          }),
+        }
+      );
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Could not add service log");
+
+      setServices((prev) => [data, ...prev]);
+      setPurchases((prev) =>
+        prev.map((p) =>
+          p.id === selectedPurchaseId
+            ? { ...p, service_count: (p.service_count || 0) + 1 }
+            : p
         )
       );
-      setServiceForm({ date: '', issue: '', cost: '' });
-      showToast('Service record saved.', 'success');
-    } catch (error) {
-      showToast(error.message, 'error');
+      setServiceForm(initialServiceForm);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setSubmittingService(false);
     }
-  };
+  }
 
-  const filteredItems = items.filter((item) => {
-    const q = searchQuery.toLowerCase();
-    const matchesSearch =
-      item.product_name.toLowerCase().includes(q) ||
-      (item.receipt_no || '').toLowerCase().includes(q) ||
-      item.category.toLowerCase().includes(q);
+  async function handleStatusChange(serviceId, nextStatus) {
+    setError("");
+    try {
+      const res = await fetch(`${API_BASE}/services/${serviceId}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status: nextStatus }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Could not update status");
 
-    if (!matchesSearch) return false;
-    if (activeTab === 'EXPIRING') return isExpiringSoon(item);
-    if (activeTab === 'EXPIRED') return isExpired(item);
-    return true;
-  });
+      setServices((prev) =>
+        prev.map((s) => (s.id === serviceId ? { ...s, status: data.status } : s))
+      );
+    } catch (err) {
+      setError(err.message);
+    }
+  }
 
-  const selectedItem = items.find((i) => i.id === selectedItemId);
+  async function handleDeleteService(serviceId) {
+    if (!window.confirm("Delete this service record?")) return;
+    setError("");
+    try {
+      const res = await fetch(`${API_BASE}/services/${serviceId}`, {
+        method: "DELETE",
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Could not delete service log");
 
-  const expiringCount = expiring.warranties.length + expiring.return_windows.length;
-  const activeCount = items.filter((i) => {
-    const days = getDaysRemaining(i.warranty_expiry);
-    return days !== null && days >= 0;
-  }).length;
-  const expiredCount = items.filter(isExpired).length;
+      setServices((prev) => prev.filter((s) => s.id !== serviceId));
+      if (selectedPurchaseId != null) {
+        setPurchases((prev) =>
+          prev.map((p) =>
+            p.id === selectedPurchaseId
+              ? { ...p, service_count: Math.max(0, (p.service_count || 1) - 1) }
+              : p
+          )
+        );
+      }
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+
+  function handleExportCsv() {
+    window.location.href = `${API_BASE}/export.csv`;
+  }
+
+  const selectedPurchase = purchases.find((p) => p.id === selectedPurchaseId);
 
   return (
-    <div className="min-h-screen bg-[#050505] text-neutral-100 font-sans antialiased relative overflow-x-hidden">
-      {/* Subtle Top White/Cyan Highlight */}
-      <div className="pointer-events-none fixed inset-x-0 top-0 h-56 bg-gradient-to-b from-white/[0.05] via-cyan-400/[0.02] to-transparent blur-2xl" />
-
-      {/* Top Navigation */}
-      <header className="sticky top-0 z-30 border-b border-[#1E1E22] bg-[#050505]/90 backdrop-blur-xl">
-        <div className="max-w-6xl mx-auto px-6 h-16 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-neutral-700 to-white p-[1px]">
-              <div className="w-full h-full rounded-[11px] bg-[#0A0A0C] flex items-center justify-center">
-                <FileText size={16} className="text-white" />
-              </div>
-            </div>
-            <div>
-              <div className="flex items-center gap-2">
-                <span className="text-sm font-semibold tracking-tight text-white">
-                  VaultLedger
-                </span>
-                <span className="text-[10px] font-mono uppercase tracking-wider px-1.5 py-0.5 rounded bg-white/10 text-neutral-200 border border-white/15">
-                  DBMS
-                </span>
-              </div>
-              <p className="text-[11px] text-neutral-400 hidden sm:block">
-                Warranty deadlines, return windows & service logs
-              </p>
-            </div>
+    <div className="vault-shell">
+      <header className="vault-header">
+        <div>
+          <div className="brand-row">
+            <h1>RECEIPTBOX</h1>
+            <span className="db-badge">DBMS</span>
           </div>
-
+          <p className="subtitle">
+            Warranty deadlines, return windows &amp; service logs
+          </p>
+        </div>
+        <div className="row-actions">
           <button
-            onClick={() => setIsAddModalOpen(true)}
-            className="inline-flex items-center gap-2 bg-white hover:bg-neutral-200 text-black font-semibold text-xs px-4 py-2 rounded-lg transition cursor-pointer"
+            type="button"
+            className="btn-secondary"
+            onClick={handleExportCsv}
           >
-            <Plus size={15} strokeWidth={2.5} />
-            New Purchase
+            Export CSV
+          </button>
+          <button
+            type="button"
+            className="btn-primary"
+            onClick={() => setIsModalOpen(true)}
+          >
+            + New Purchase
           </button>
         </div>
       </header>
 
-      {/* Main Content */}
-      <main className="relative max-w-6xl mx-auto px-6 py-8 space-y-7">
-        {/* Metric Cards */}
-        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-          <div className="rounded-xl bg-[#0E0E10] border border-[#222226] p-4 hover:border-neutral-600 transition">
-            <div className="flex items-center justify-between text-xs text-neutral-400">
-              <span>Vault Inventory</span>
-              <Sparkles size={14} className="text-neutral-300" />
-            </div>
-            <div className="text-2xl font-bold text-white mt-2 tabular-nums">{items.length}</div>
-            <div className="text-[11px] text-neutral-500 mt-1">Registered receipts</div>
-          </div>
+      {error && (
+        <div className="error-banner" role="alert">
+          {error}
+        </div>
+      )}
 
-          <div className="rounded-xl bg-[#0E0E10] border border-amber-500/35 p-4 hover:border-amber-400/55 transition">
-            <div className="flex items-center justify-between text-xs text-amber-300">
-              <span>Expiring Soon</span>
-              <Clock size={14} className="text-amber-400" />
-            </div>
-            <div className="text-2xl font-bold text-amber-200 mt-2 tabular-nums">{expiringCount}</div>
-            <div className="text-[11px] text-amber-300/65 mt-1">Action window open</div>
-          </div>
+      <section className="kpi-grid" aria-label="Vault summary">
+        <div className="kpi-card">
+          <span className="kpi-label">Vault Inventory</span>
+          <strong className="kpi-value">{stats.total}</strong>
+          <span className="kpi-sub">Registered receipts</span>
+        </div>
+        <div className="kpi-card">
+          <span className="kpi-label">Expiring Soon</span>
+          <strong className="kpi-value warn-text">{stats.expiringSoon}</strong>
+          <span className="kpi-sub">Action window open</span>
+        </div>
+        <div className="kpi-card">
+          <span className="kpi-label">Active Coverage</span>
+          <strong className="kpi-value ok-text">{stats.activeCoverage}</strong>
+          <span className="kpi-sub">Within warranty period</span>
+        </div>
+        <div className="kpi-card">
+          <span className="kpi-label">Expired</span>
+          <strong className="kpi-value">{stats.expired}</strong>
+          <span className="kpi-sub">Past warranty date</span>
+        </div>
+      </section>
 
-          <div className="rounded-xl bg-[#0E0E10] border border-[#222226] p-4 hover:border-cyan-500/40 transition">
-            <div className="flex items-center justify-between text-xs text-cyan-300">
-              <span>Active Coverage</span>
-              <ShieldCheck size={14} className="text-cyan-400" />
-            </div>
-            <div className="text-2xl font-bold text-white mt-2 tabular-nums">{activeCount}</div>
-            <div className="text-[11px] text-neutral-500 mt-1">Within warranty period</div>
-          </div>
-
-          <div className="rounded-xl bg-[#0E0E10] border border-[#222226] p-4 hover:border-neutral-700 transition">
-            <div className="flex items-center justify-between text-xs text-neutral-400">
-              <span>Expired</span>
-              <Calendar size={14} className="text-neutral-500" />
-            </div>
-            <div className="text-2xl font-bold text-neutral-300 mt-2 tabular-nums">{expiredCount}</div>
-            <div className="text-[11px] text-neutral-500 mt-1">Past warranty date</div>
-          </div>
+      <section className="toolbar">
+        <div className="filter-tabs" role="tablist">
+          <button
+            type="button"
+            className={filterTab === "all" ? "tab active" : "tab"}
+            onClick={() => setFilterTab("all")}
+          >
+            All Items ({stats.total})
+          </button>
+          <button
+            type="button"
+            className={filterTab === "expiring" ? "tab active" : "tab"}
+            onClick={() => setFilterTab("expiring")}
+          >
+            Expiring Soon ({stats.expiringSoon})
+          </button>
+          <button
+            type="button"
+            className={filterTab === "expired" ? "tab active" : "tab"}
+            onClick={() => setFilterTab("expired")}
+          >
+            Expired ({stats.expired})
+          </button>
         </div>
 
-        {/* Filter & Search Bar */}
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-          <div className="inline-flex items-center bg-[#0E0E10] border border-[#222226] rounded-xl p-1 self-start">
-            <button
-              onClick={() => setActiveTab('ALL')}
-              className={`px-3.5 py-1.5 rounded-lg text-xs font-medium transition cursor-pointer ${
-                activeTab === 'ALL'
-                  ? 'bg-white text-black font-semibold'
-                  : 'text-neutral-400 hover:text-white'
-              }`}
-            >
-              All Items ({items.length})
-            </button>
-            <button
-              onClick={() => setActiveTab('EXPIRING')}
-              className={`px-3.5 py-1.5 rounded-lg text-xs font-medium transition cursor-pointer ${
-                activeTab === 'EXPIRING'
-                  ? 'bg-amber-400 text-black font-semibold'
-                  : 'text-neutral-400 hover:text-amber-300'
-              }`}
-            >
-              Expiring Soon ({expiringCount})
-            </button>
-            <button
-              onClick={() => setActiveTab('EXPIRED')}
-              className={`px-3.5 py-1.5 rounded-lg text-xs font-medium transition cursor-pointer ${
-                activeTab === 'EXPIRED'
-                  ? 'bg-neutral-800 text-white border border-neutral-600'
-                  : 'text-neutral-400 hover:text-white'
-              }`}
-            >
-              Expired ({expiredCount})
-            </button>
-          </div>
+        <input
+          type="search"
+          className="search-input"
+          placeholder="Search product, category, store, receipt..."
+          value={searchQuery}
+          onChange={(e) => setSearchQuery(e.target.value)}
+        />
+      </section>
 
-          <div className="relative w-full sm:w-72">
-            <Search size={14} className="absolute left-3.5 top-1/2 -translate-y-1/2 text-neutral-500" />
-            <input
-              type="text"
-              placeholder="Search product, category, receipt..."
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-              className="w-full h-[38px] bg-[#0E0E10] border border-[#222226] rounded-xl pl-9 pr-3 text-xs text-white placeholder-neutral-500 focus:outline-none focus:border-neutral-500 transition"
-            />
-          </div>
-        </div>
-
-        {/* Vault Table */}
-        <div className="rounded-xl bg-[#0E0E10] border border-[#222226] shadow-2xl overflow-hidden">
-          <div className="overflow-x-auto">
-            <table className="w-full text-left border-collapse">
+      <section className="table-card">
+        {loading ? (
+          <p className="empty-state">Loading purchases from SQLite...</p>
+        ) : filteredPurchases.length === 0 ? (
+          <p className="empty-state">No matching purchases found.</p>
+        ) : (
+          <div className="table-wrap">
+            <table className="vault-table">
               <thead>
-                <tr className="border-b border-[#222226] bg-[#09090B] text-[11px] font-semibold uppercase tracking-wider text-neutral-400">
-                  <th className="py-3.5 px-5">Product & Category</th>
-                  <th className="py-3.5 px-5">Receipt No.</th>
-                  <th className="py-3.5 px-5">Purchase Date</th>
-                  <th className="py-3.5 px-5">Return Window</th>
-                  <th className="py-3.5 px-5">Warranty Status</th>
-                  <th className="py-3.5 px-5 text-right">Service & Actions</th>
+                <tr>
+                  <th>Product &amp; Category</th>
+                  <th>Receipt No.</th>
+                  <th>Purchase Date</th>
+                  <th>Return Window</th>
+                  <th>Warranty Status</th>
+                  <th>Service &amp; Actions</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-[#1A1A1F] text-xs">
-                {filteredItems.length === 0 ? (
-                  <tr>
-                    <td colSpan="6" className="py-14 text-center text-neutral-500">
-                      No matching items found in the vault.
+              <tbody>
+                {filteredPurchases.map((item) => (
+                  <tr key={item.id}>
+                    <td>
+                      <div className="product-title">{item.product_name}</div>
+                      <div className="product-meta">
+                        <span className="pill">{item.category}</span>
+                        {item.store_name && <span>{item.store_name}</span>}
+                        {item.price != null && (
+                          <span>₹{Number(item.price).toLocaleString()}</span>
+                        )}
+                      </div>
+                    </td>
+                    <td className="mono">{item.receipt_no || `#${item.id}`}</td>
+                    <td className="mono">{item.purchase_date}</td>
+                    <td>
+                      <span className={`badge ${item.returnWindow.tone}`}>
+                        {item.returnWindow.label}
+                      </span>
+                    </td>
+                    <td>
+                      <span className={`badge ${item.warranty.tone}`}>
+                        {item.warranty.label}
+                      </span>
+                    </td>
+                    <td>
+                      <div className="row-actions">
+                        <button
+                          type="button"
+                          className="btn-secondary"
+                          onClick={() => openServices(item.id)}
+                        >
+                          Logs ({item.service_count ?? 0})
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-secondary"
+                          onClick={() => openEditModal(item)}
+                        >
+                          Edit
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-ghost"
+                          onClick={() => handleDeletePurchase(item.id, item.product_name)}
+                        >
+                          Delete
+                        </button>
+                      </div>
                     </td>
                   </tr>
-                ) : (
-                  filteredItems.map((item) => {
-                    const wDays = getDaysRemaining(item.warranty_expiry);
-                    const rDays = getDaysRemaining(item.return_deadline);
-
-                    return (
-                      <tr key={item.id} className="hover:bg-white/[0.025] transition">
-                        <td className="py-4 px-5">
-                          <div className="font-semibold text-white text-[13px]">{item.product_name}</div>
-                          <span className="inline-block mt-1 text-[11px] px-2 py-0.5 rounded-md bg-[#16161A] text-neutral-300 border border-[#26262C]">
-                            {item.category}
-                          </span>
-                        </td>
-
-                        <td className="py-4 px-5 font-mono text-cyan-300/90">
-                          {item.receipt_no}
-                        </td>
-
-                        <td className="py-4 px-5 font-mono text-neutral-300 tabular-nums">
-                          {item.purchase_date}
-                        </td>
-
-                        <td className="py-4 px-5 tabular-nums">
-                          {rDays !== null && rDays > 0 ? (
-                            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/30 font-medium">
-                              <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
-                              {rDays}d left ({item.return_deadline})
-                            </span>
-                          ) : (
-                            <span className="text-neutral-500 font-mono">Closed</span>
-                          )}
-                        </td>
-
-                        <td className="py-4 px-5 tabular-nums">
-                          {wDays === null ? (
-                            <span className="text-neutral-500">Not recorded</span>
-                          ) : wDays < 0 ? (
-                            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-[#16161A] text-neutral-400 border border-[#26262C]">
-                              Expired ({item.warranty_expiry})
-                            </span>
-                          ) : wDays <= 30 ? (
-                            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/35 font-semibold">
-                              <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
-                              {wDays}d left ({item.warranty_expiry})
-                            </span>
-                          ) : (
-                            <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-cyan-500/12 text-cyan-300 border border-cyan-500/30 font-medium">
-                              <span className="w-1.5 h-1.5 rounded-full bg-cyan-400" />
-                              Active until {item.warranty_expiry}
-                            </span>
-                          )}
-                        </td>
-
-                        <td className="py-4 px-5 text-right">
-                          <div className="inline-flex items-center gap-2">
-                            <button
-                              onClick={() => handleOpenServices(item.id)}
-                              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-[#2C2C32] bg-[#151519] hover:bg-[#1E1E24] text-white font-medium transition cursor-pointer"
-                            >
-                              <Wrench size={12} className="text-cyan-400" />
-                              Logs ({item.service_count})
-                            </button>
-                          </div>
-                        </td>
-                      </tr>
-                    );
-                  })
-                )}
+                ))}
               </tbody>
             </table>
           </div>
-        </div>
-      </main>
+        )}
+      </section>
 
-      {/* Add Purchase Modal */}
-      {isAddModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-xs p-4">
-          <div className="w-full max-w-lg max-h-[90vh] overflow-y-auto rounded-2xl bg-[#0E0E10] border border-[#26262C] shadow-2xl">
-            <div className="px-6 py-4 border-b border-[#222226] flex items-center justify-between bg-[#09090B]">
-              <div>
-                <h2 className="text-sm font-semibold text-white">Log New Purchase</h2>
-                <p className="text-[11px] text-neutral-400">Add purchase details and warranty duration</p>
-              </div>
+      {selectedPurchaseId && (
+        <section ref={servicesSectionRef} className="service-panel">
+          <div className="panel-header">
+            <div>
+              <h2>
+                Service Records —{" "}
+                {selectedPurchase?.product_name || `Purchase #${selectedPurchaseId}`}
+              </h2>
+              <p className="subtitle">
+                Purchase #{selectedPurchaseId} ·{" "}
+                {selectedPurchase?.store_name || "Store"} · Total Service Spend: ₹
+                {totalServiceCost.toLocaleString()}
+              </p>
+            </div>
+            <button
+              type="button"
+              className="btn-ghost"
+              onClick={() => setSelectedPurchaseId(null)}
+            >
+              Close
+            </button>
+          </div>
+
+          <form className="service-form" onSubmit={handleCreateService}>
+            <input
+              type="date"
+              required
+              value={serviceForm.service_date}
+              onChange={(e) =>
+                setServiceForm((f) => ({ ...f, service_date: e.target.value }))
+              }
+            />
+            <input
+              type="text"
+              required
+              placeholder="Issue or repair description"
+              value={serviceForm.issue}
+              onChange={(e) =>
+                setServiceForm((f) => ({ ...f, issue: e.target.value }))
+              }
+            />
+            <input
+              type="number"
+              min="0"
+              step="0.01"
+              placeholder="Cost"
+              value={serviceForm.cost}
+              onChange={(e) =>
+                setServiceForm((f) => ({ ...f, cost: e.target.value }))
+              }
+            />
+            <select
+              value={serviceForm.status}
+              onChange={(e) =>
+                setServiceForm((f) => ({ ...f, status: e.target.value }))
+              }
+            >
+              <option value="Pending">Pending</option>
+              <option value="In Progress">In Progress</option>
+              <option value="Completed">Completed</option>
+            </select>
+            <button
+              type="submit"
+              className="btn-primary"
+              disabled={submittingService}
+            >
+              {submittingService ? "Saving..." : "Add Service"}
+            </button>
+          </form>
+
+          {loadingServices ? (
+            <p className="empty-state">Loading service logs...</p>
+          ) : services.length === 0 ? (
+            <p className="empty-state">
+              No service records logged for this item yet.
+            </p>
+          ) : (
+            <ul className="service-list">
+              {services.map((srv) => (
+                <li key={srv.id} className="service-item">
+                  <div>
+                    <strong>{srv.issue}</strong>
+                    <div className="product-meta">
+                      <span className="mono">{srv.date}</span>
+                      <span>Cost: ₹{Number(srv.cost || 0).toLocaleString()}</span>
+                    </div>
+                  </div>
+                  <div className="row-actions">
+                    <span className={`badge ${getServiceStatusTone(srv.status)}`}>
+                      {srv.status}
+                    </span>
+                    <select
+                      aria-label={`Status for ${srv.issue}`}
+                      value={srv.status}
+                      onChange={(e) => handleStatusChange(srv.id, e.target.value)}
+                    >
+                      <option value="Pending">Pending</option>
+                      <option value="In Progress">In Progress</option>
+                      <option value="Completed">Completed</option>
+                    </select>
+                    <button
+                      type="button"
+                      className="btn-ghost"
+                      onClick={() => handleDeleteService(srv.id)}
+                    >
+                      Delete
+                    </button>
+                  </div>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+      )}
+
+      {isModalOpen && (
+        <div className="modal-backdrop" onClick={() => setIsModalOpen(false)}>
+          <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+            <div className="panel-header">
+              <h2>Add Purchase &amp; Warranty</h2>
               <button
-                onClick={() => setIsAddModalOpen(false)}
-                className="p-1 rounded-lg text-neutral-400 hover:text-white hover:bg-[#1B1B20] cursor-pointer"
+                type="button"
+                className="btn-ghost"
+                onClick={() => setIsModalOpen(false)}
               >
-                <X size={16} />
+                ✕
               </button>
             </div>
 
-            <form onSubmit={handleAddPurchase} className="p-6 space-y-4 text-xs">
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 items-end">
-                <div className="sm:col-span-2">
-                  <label className="block text-neutral-300 font-medium mb-1.5">Product Name</label>
-                  <input
-                    type="text"
-                    required
-                    placeholder="e.g., Dyson V8 Absolute"
-                    value={formData.product_name}
-                    onChange={(e) => setFormData({ ...formData, product_name: e.target.value })}
-                    className="w-full h-[38px] bg-[#050505] border border-[#26262C] rounded-lg px-3 text-white focus:outline-none focus:border-white"
-                  />
-                </div>
+            <form className="modal-form" onSubmit={handleCreatePurchase}>
+              <label>
+                Product Name *
+                <input
+                  type="text"
+                  required
+                  value={purchaseForm.product_name}
+                  onChange={(e) =>
+                    setPurchaseForm((f) => ({
+                      ...f,
+                      product_name: e.target.value,
+                    }))
+                  }
+                />
+              </label>
 
-                <div>
-                  <label className="block text-neutral-300 font-medium mb-1.5">Brand</label>
-                  <input
-                    type="text"
-                    placeholder="Optional"
-                    value={formData.brand}
-                    onChange={(e) => setFormData({ ...formData, brand: e.target.value })}
-                    className="w-full h-[38px] bg-[#050505] border border-[#26262C] rounded-lg px-3 text-white focus:outline-none focus:border-white"
-                  />
-                </div>
+              <label>
+                Brand
+                <input
+                  type="text"
+                  value={purchaseForm.brand}
+                  onChange={(e) =>
+                    setPurchaseForm((f) => ({ ...f, brand: e.target.value }))
+                  }
+                />
+              </label>
 
-                <div>
-                  <label className="block text-neutral-300 font-medium mb-1.5">Category</label>
-                  <select
-                    value={formData.category}
-                    onChange={(e) => setFormData({ ...formData, category: e.target.value })}
-                    className="w-full h-[38px] bg-[#050505] border border-[#26262C] rounded-lg px-3 text-white focus:outline-none focus:border-white"
-                  >
-                    <option value="Electronics">Electronics</option>
-                    <option value="Appliances">Appliances</option>
-                    <option value="Furniture">Furniture</option>
-                    <option value="Tools">Tools</option>
-                  </select>
-                </div>
+              <label>
+                Category *
+                <input
+                  type="text"
+                  required
+                  value={purchaseForm.category}
+                  onChange={(e) =>
+                    setPurchaseForm((f) => ({ ...f, category: e.target.value }))
+                  }
+                />
+              </label>
 
-                <div>
-                  <label className="block text-neutral-300 font-medium mb-1.5">Store</label>
-                  <input
-                    type="text"
-                    required
-                    placeholder="Store name"
-                    value={formData.store_name}
-                    onChange={(e) => setFormData({ ...formData, store_name: e.target.value })}
-                    className="w-full h-[38px] bg-[#050505] border border-[#26262C] rounded-lg px-3 text-white focus:outline-none focus:border-white"
-                  />
-                </div>
+              <label>
+                Store Name *
+                <input
+                  type="text"
+                  required
+                  value={purchaseForm.store_name}
+                  onChange={(e) =>
+                    setPurchaseForm((f) => ({ ...f, store_name: e.target.value }))
+                  }
+                />
+              </label>
 
-                <div>
-                  <label className="block text-neutral-300 font-medium mb-1.5">Store City</label>
-                  <input
-                    type="text"
-                    placeholder="Optional"
-                    value={formData.city}
-                    onChange={(e) => setFormData({ ...formData, city: e.target.value })}
-                    className="w-full h-[38px] bg-[#050505] border border-[#26262C] rounded-lg px-3 text-white focus:outline-none focus:border-white"
-                  />
-                </div>
+              <label>
+                City
+                <input
+                  type="text"
+                  value={purchaseForm.city}
+                  onChange={(e) =>
+                    setPurchaseForm((f) => ({ ...f, city: e.target.value }))
+                  }
+                />
+              </label>
 
-                <div>
-                  <label className="block text-neutral-300 font-medium mb-1.5">Price (₹)</label>
-                  <input
-                    type="number"
-                    min="0"
-                    step="0.01"
-                    required
-                    value={formData.price}
-                    onChange={(e) => setFormData({ ...formData, price: e.target.value })}
-                    className="w-full h-[38px] bg-[#050505] border border-[#26262C] rounded-lg px-3 text-white"
-                  />
-                </div>
+              <label>
+                Receipt No.
+                <input
+                  type="text"
+                  value={purchaseForm.receipt_no}
+                  onChange={(e) =>
+                    setPurchaseForm((f) => ({ ...f, receipt_no: e.target.value }))
+                  }
+                />
+              </label>
 
-                <div>
-                  <label className="block text-neutral-300 font-medium mb-1.5">Receipt Number</label>
-                  <input
-                    type="text"
-                    placeholder="INV-2026-04"
-                    value={formData.receipt_no}
-                    onChange={(e) => setFormData({ ...formData, receipt_no: e.target.value })}
-                    className="w-full h-[38px] bg-[#050505] border border-[#26262C] rounded-lg px-3 font-mono text-white focus:outline-none focus:border-white"
-                  />
-                </div>
+              <label>
+                Purchase Date *
+                <input
+                  type="date"
+                  required
+                  value={purchaseForm.purchase_date}
+                  onChange={(e) =>
+                    setPurchaseForm((f) => ({
+                      ...f,
+                      purchase_date: e.target.value,
+                    }))
+                  }
+                />
+              </label>
 
-                <div>
-                  <label className="block text-neutral-300 font-medium mb-1.5">Purchase Date</label>
-                  <input
-                    type="date"
-                    required
-                    value={formData.purchase_date}
-                    onChange={(e) => setFormData({ ...formData, purchase_date: e.target.value })}
-                    className="w-full h-[38px] bg-[#050505] border border-[#26262C] rounded-lg px-3 text-white [color-scheme:dark]"
-                  />
-                </div>
+              <label>
+                Price *
+                <input
+                  type="number"
+                  required
+                  min="0"
+                  step="0.01"
+                  value={purchaseForm.price}
+                  onChange={(e) =>
+                    setPurchaseForm((f) => ({ ...f, price: e.target.value }))
+                  }
+                />
+              </label>
 
-                <div>
-                  <label className="block text-neutral-300 font-medium mb-1.5">Warranty Type</label>
-                  <select
-                    value={formData.warranty_type}
-                    onChange={(e) => setFormData({ ...formData, warranty_type: e.target.value })}
-                    className="w-full h-[38px] bg-[#050505] border border-[#26262C] rounded-lg px-3 text-white"
-                  >
-                    <option value="Standard">Standard</option>
-                    <option value="Extended">Extended</option>
-                  </select>
-                </div>
+              <label>
+                Return Window (Days)
+                <input
+                  type="number"
+                  min="0"
+                  value={purchaseForm.return_days}
+                  onChange={(e) =>
+                    setPurchaseForm((f) => ({
+                      ...f,
+                      return_days: e.target.value,
+                    }))
+                  }
+                />
+              </label>
 
-                <div>
-                  <label className="block text-neutral-300 font-medium mb-1.5">Warranty (months)</label>
-                  <input
-                    type="number"
-                    min="1"
-                    required
-                    value={formData.warranty_months}
-                    onChange={(e) => setFormData({ ...formData, warranty_months: e.target.value })}
-                    className="w-full h-[38px] bg-[#050505] border border-[#26262C] rounded-lg px-3 text-white"
-                  />
-                </div>
-              </div>
-              <p className="text-[11px] text-neutral-500">
-                The database sets the return deadline and warranty end date automatically.
-              </p>
+              <label>
+                Warranty Type *
+                <select
+                  value={purchaseForm.warranty_type}
+                  onChange={(e) =>
+                    setPurchaseForm((f) => ({
+                      ...f,
+                      warranty_type: e.target.value,
+                    }))
+                  }
+                >
+                  <option value="Standard">Standard</option>
+                  <option value="Extended">Extended</option>
+                </select>
+              </label>
 
-              <div className="pt-3 flex justify-end gap-2.5 border-t border-[#222226]">
+              <label>
+                Warranty Months *
+                <input
+                  type="number"
+                  required
+                  min="1"
+                  value={purchaseForm.warranty_months}
+                  onChange={(e) =>
+                    setPurchaseForm((f) => ({
+                      ...f,
+                      warranty_months: e.target.value,
+                    }))
+                  }
+                />
+              </label>
+
+              <label>
+                Warranty Start Date (optional)
+                <input
+                  type="date"
+                  value={purchaseForm.warranty_start_date}
+                  onChange={(e) =>
+                    setPurchaseForm((f) => ({
+                      ...f,
+                      warranty_start_date: e.target.value,
+                    }))
+                  }
+                />
+              </label>
+
+              <div className="modal-actions full-span">
                 <button
                   type="button"
-                  onClick={() => setIsAddModalOpen(false)}
-                  className="h-[36px] px-4 rounded-lg border border-[#2B2B30] text-neutral-300 hover:text-white cursor-pointer"
+                  className="btn-ghost"
+                  onClick={() => setIsModalOpen(false)}
                 >
                   Cancel
                 </button>
                 <button
                   type="submit"
-                  className="h-[36px] px-4 rounded-lg bg-white hover:bg-neutral-200 text-black font-semibold cursor-pointer"
+                  className="btn-primary"
+                  disabled={submittingPurchase}
                 >
-                  Save to Vault
+                  {submittingPurchase ? "Saving..." : "Save to Vault"}
                 </button>
               </div>
             </form>
@@ -592,125 +876,111 @@ export default function App() {
         </div>
       )}
 
-      {/* Service History Drawer */}
-      {selectedItem && (
-        <div className="fixed inset-0 z-50 flex justify-end bg-black/75 backdrop-blur-xs">
-          <div className="w-full max-w-md bg-[#0E0E10] border-l border-[#222226] h-full flex flex-col justify-between overflow-y-auto shadow-2xl">
-            <div className="p-6 space-y-6">
-              <div className="flex items-start justify-between border-b border-[#222226] pb-4">
-                <div>
-                  <span className="text-[10px] font-mono uppercase tracking-wider text-cyan-400">
-                    Service History
-                  </span>
-                  <h3 className="text-base font-semibold text-white mt-0.5">
-                    {selectedItem.product_name}
-                  </h3>
-                  <p className="text-xs font-mono text-neutral-400 mt-1">
-                    {selectedItem.receipt_no || 'No receipt'} • Warranty ends {selectedItem.warranty_expiry || 'Not recorded'}
-                  </p>
-                </div>
-                <button
-                  onClick={() => setSelectedItemId(null)}
-                  className="p-1.5 rounded-lg text-neutral-400 hover:text-white hover:bg-[#1B1B20] cursor-pointer"
-                >
-                  <X size={16} />
-                </button>
-              </div>
-
-              <form
-                onSubmit={handleAddServiceLog}
-                className="p-4 rounded-xl bg-[#050505] border border-[#222226] space-y-3 text-xs"
+      {editingPurchase && (
+        <div
+          className="modal-backdrop"
+          onClick={() => setEditingPurchase(null)}
+        >
+          <div className="modal-card" onClick={(e) => e.stopPropagation()}>
+            <div className="panel-header">
+              <h2>Edit — {editingPurchase.product_name}</h2>
+              <button
+                type="button"
+                className="btn-ghost"
+                onClick={() => setEditingPurchase(null)}
               >
-                <div className="font-semibold text-white">Log Service Entry</div>
-                <div className="grid grid-cols-2 gap-3 items-end">
-                  <div>
-                    <label className="block text-neutral-400 mb-1">Service Date</label>
-                    <input
-                      type="date"
-                      required
-                      value={serviceForm.date}
-                      onChange={(e) => setServiceForm({ ...serviceForm, date: e.target.value })}
-                      className="w-full h-[36px] bg-[#0E0E10] border border-[#26262C] rounded-lg px-2.5 text-white [color-scheme:dark]"
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-neutral-400 mb-1">Billed Cost (₹)</label>
-                    <input
-                      type="number"
-                      min="0"
-                      placeholder="0"
-                      value={serviceForm.cost}
-                      onChange={(e) => setServiceForm({ ...serviceForm, cost: e.target.value })}
-                      className="w-full h-[36px] bg-[#0E0E10] border border-[#26262C] rounded-lg px-2.5 text-white"
-                    />
-                  </div>
-                </div>
-                <div>
-                  <label className="block text-neutral-400 mb-1">Issue / Work Performed</label>
-                  <input
-                    type="text"
-                    required
-                    placeholder="e.g., Hinge calibration or part replacement"
-                    value={serviceForm.issue}
-                    onChange={(e) => setServiceForm({ ...serviceForm, issue: e.target.value })}
-                    className="w-full h-[36px] bg-[#0E0E10] border border-[#26262C] rounded-lg px-2.5 text-white"
-                  />
-                </div>
+                ✕
+              </button>
+            </div>
+
+            <form className="modal-form" onSubmit={handleSaveEdit}>
+              <label>
+                Price
+                <input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  value={editForm.price}
+                  onChange={(e) =>
+                    setEditForm((f) => ({ ...f, price: e.target.value }))
+                  }
+                />
+              </label>
+
+              <label>
+                Receipt No.
+                <input
+                  type="text"
+                  value={editForm.receipt_no}
+                  onChange={(e) =>
+                    setEditForm((f) => ({ ...f, receipt_no: e.target.value }))
+                  }
+                />
+              </label>
+
+              <label>
+                Return Deadline
+                <input
+                  type="date"
+                  value={editForm.return_deadline}
+                  onChange={(e) =>
+                    setEditForm((f) => ({
+                      ...f,
+                      return_deadline: e.target.value,
+                    }))
+                  }
+                />
+              </label>
+
+              <label>
+                Warranty Type
+                <select
+                  value={editForm.warranty_type}
+                  onChange={(e) =>
+                    setEditForm((f) => ({
+                      ...f,
+                      warranty_type: e.target.value,
+                    }))
+                  }
+                >
+                  <option value="Standard">Standard</option>
+                  <option value="Extended">Extended</option>
+                </select>
+              </label>
+
+              <label className="full-span">
+                Warranty Months
+                <input
+                  type="number"
+                  min="1"
+                  value={editForm.warranty_months}
+                  onChange={(e) =>
+                    setEditForm((f) => ({
+                      ...f,
+                      warranty_months: e.target.value,
+                    }))
+                  }
+                />
+              </label>
+
+              <div className="modal-actions full-span">
+                <button
+                  type="button"
+                  className="btn-ghost"
+                  onClick={() => setEditingPurchase(null)}
+                >
+                  Cancel
+                </button>
                 <button
                   type="submit"
-                  className="w-full h-[36px] bg-white hover:bg-neutral-200 text-black font-semibold rounded-lg transition cursor-pointer"
+                  className="btn-primary"
+                  disabled={savingEdit}
                 >
-                  Add Service Log
+                  {savingEdit ? "Updating..." : "Save Changes"}
                 </button>
-              </form>
-
-              <div className="space-y-2.5">
-                <div className="text-xs font-semibold uppercase tracking-wider text-neutral-400">
-                  Past Logs ({services.length})
-                </div>
-                {servicesLoading ? (
-                  <p className="text-xs text-neutral-500 py-4">Loading service history...</p>
-                ) : servicesError ? (
-                  <p className="text-xs text-rose-300 py-4">{servicesError}</p>
-                ) : services.length === 0 ? (
-                  <p className="text-xs text-neutral-500 py-4">No service entries recorded yet.</p>
-                ) : (
-                  services.map((log) => (
-                    <div
-                      key={log.id}
-                      className="p-3.5 rounded-xl bg-[#050505] border border-[#222226] flex items-start justify-between gap-3 text-xs"
-                    >
-                      <div>
-                        <div className="font-mono text-neutral-400">{log.date}</div>
-                        <div className="text-white font-medium mt-0.5">{log.issue}</div>
-                      </div>
-                      <span className="font-mono px-2 py-0.5 rounded bg-cyan-500/12 text-cyan-300 border border-cyan-500/25 shrink-0">
-                        ₹{log.cost}
-                      </span>
-                    </div>
-                  ))
-                )}
               </div>
-            </div>
+            </form>
           </div>
-        </div>
-      )}
-
-      {/* Toast Notification */}
-      {toast && (
-        <div
-          className={`fixed bottom-5 right-5 z-50 flex items-center gap-2.5 px-4 py-3 rounded-xl border text-xs shadow-2xl backdrop-blur-md ${
-            toast.type === 'error'
-              ? 'bg-rose-950/90 border-rose-500/40 text-rose-200'
-              : 'bg-[#0E0E10]/95 border-[#32323A] text-white'
-          }`}
-        >
-          {toast.type === 'error' ? (
-            <AlertCircle size={15} className="text-rose-400 shrink-0" />
-          ) : (
-            <Check size={15} className="text-cyan-400 shrink-0" />
-          )}
-          <span>{toast.message}</span>
         </div>
       )}
     </div>
